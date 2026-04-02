@@ -1,0 +1,11 @@
+# requirements.txt
+# 核心依赖（必装）
+pywin32>=306
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+keyboard>=0.13.5
+scipy>=1.11.0
+
+# 可选依赖（风速OCR，不装也能用模板匹配或像素法）
+# pytesseract>=0.3.10
