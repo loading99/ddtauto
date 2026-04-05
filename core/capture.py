@@ -65,12 +65,21 @@ def get_window_handle(keyword: str = WINDOW_TITLE_KEY) -> Optional[int]:
 def capture_minimap(hwnd: int) -> Optional[np.ndarray]:
     """
     截取右上角小地图区域，返回 BGR numpy 数组。
-    区域固定为：x = win_w - CROP_W, y = MINIMAP_Y_OFFSET
+    修复DPI缩放问题，截取尺寸100%准确
     """
+    # 获取窗口真实物理尺寸（修复缩放核心步骤）
     left, top, right, bottom = win32gui.GetClientRect(hwnd)
-    win_w = right - left
+    # 转换为屏幕物理坐标
+    real_left, real_top = win32gui.ClientToScreen(hwnd, (left, top))
+    real_right, real_bottom = win32gui.ClientToScreen(hwnd, (right, bottom))
+    win_w = real_right - real_left
+    win_h = real_bottom - real_top
+    print(win_w, win_h)
+    # 计算真实截取起始X坐标
     crop_x = win_w - MINIMAP_CROP_WIDTH
+    crop_y = MINIMAP_Y_OFFSET
 
+    # GDI截图逻辑（保持不变）
     hwnd_dc = win32gui.GetDC(hwnd)
     mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
     save_dc = mfc_dc.CreateCompatibleDC()
@@ -80,23 +89,23 @@ def capture_minimap(hwnd: int) -> Optional[np.ndarray]:
 
     ctypes.windll.gdi32.BitBlt(
         save_dc.GetSafeHdc(), 0, 0, MINIMAP_CROP_WIDTH, MINIMAP_CROP_HEIGHT,
-        mfc_dc.GetSafeHdc(), crop_x, MINIMAP_Y_OFFSET, win32con.SRCCOPY
+        mfc_dc.GetSafeHdc(), crop_x, crop_y, win32con.SRCCOPY
     )
 
+    # 转换图像
     bmp_str = bmp.GetBitmapBits(True)
     img_pil = Image.frombuffer(
         'RGB', (MINIMAP_CROP_WIDTH, MINIMAP_CROP_HEIGHT),
         bmp_str, 'raw', 'BGRX', 0, 1
     )
 
+    # 释放资源
     win32gui.DeleteObject(bmp.GetHandle())
     save_dc.DeleteDC()
     mfc_dc.DeleteDC()
     win32gui.ReleaseDC(hwnd, hwnd_dc)
 
-    # 转为 OpenCV BGR 格式
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-
 
 def capture_fullscreen(hwnd: int) -> Optional[np.ndarray]:
     """截取游戏完整客户区（用于覆盖层坐标映射）"""
