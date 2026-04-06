@@ -37,10 +37,15 @@ PLAYER_RING_DELTA_MAX = 10
 
 # ---------- 风速识别区域（顶部中间） ----------
 # 相对游戏窗口的比例坐标（适配任意分辨率）
-WIND_ROI_LEFT_RATIO   = 0.38
-WIND_ROI_RIGHT_RATIO  = 0.62
-WIND_ROI_TOP_RATIO    = 0.0382
-WIND_ROI_BOTTOM_RATIO = 0.1184
+WIND_ROI_LEFT_RATIO   = 0.453
+WIND_ROI_RIGHT_RATIO  = 0.538
+WIND_ROI_TOP_RATIO    = 0.065
+WIND_ROI_BOTTOM_RATIO = 0.12
+
+ANGLE_ROI_LEFT_RATIO   = 0.028
+ANGLE_ROI_RIGHT_RATIO  = 0.072
+ANGLE_ROI_TOP_RATIO    = 0.92
+ANGLE_ROI_BOTTOM_RATIO = 0.96
 
 # ---------- 物理参数（需要标定，初始估算值） ----------
 # 初速度最大值（满蓄力100时），单位：游戏距离/帧 或相对单位

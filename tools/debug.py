@@ -92,14 +92,15 @@ def debug_wind():
         print("未找到窗口")
         return
 
-    print("连续识别风速，按 Q 停止...")
+    print("连续识别风速，按 Q 停止, 按S 保存...")
+    os.makedirs('wind', exist_ok=True)
     while True:
+        print("正在保存")
+        timestamp = int(time.time())
         roi = capture_wind_roi(hwnd)
-        wind = detect_wind(hwnd)
         if roi is not None:
-            cv2.imwrite("debug_wind_roi.png", roi)
-            print(f"风速: {wind:+d}  (ROI已保存)")
-        time.sleep(1)
+            cv2.imwrite(f'wind/wind_{timestamp}.png', roi)
+        time.sleep(2)
         if keyboard.is_pressed('q'):
             break
 
@@ -144,6 +145,28 @@ def debug_calibrate():
             print(f"    θ={r.theta_deg}° P={r.power:.0f} w={r.wind:+.0f} "
                   f"→ ({r.dx_actual:.1f}, {r.dy_actual:.1f})")
 
+def debug_angle():
+    """测试风速识别"""
+    from core.capture import get_window_handle
+    from core.angle import capture_angle_roi
+
+    hwnd = get_window_handle()
+    if not hwnd:
+        print("未找到窗口")
+        return
+
+    print("连续识别角度，按 Q 停止, 按S 保存...")
+    os.makedirs('angle', exist_ok=True)
+    while True:
+        print("正在保存")
+        timestamp = int(time.time())
+        roi = capture_angle_roi(hwnd)
+        if roi is not None:
+            cv2.imwrite(f'angle/angle_{timestamp}.png', roi)
+        time.sleep(2)
+        if keyboard.is_pressed('q'):
+            break
+
 
 if __name__ == '__main__':
     cmd = sys.argv[1] if len(sys.argv) > 1 else 'minimap'
@@ -152,4 +175,5 @@ if __name__ == '__main__':
         'wind':      debug_wind,
         'physics':   debug_physics,
         'calibrate': debug_calibrate,
+        'angle': debug_angle,
     }.get(cmd, debug_minimap)()
