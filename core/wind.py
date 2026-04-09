@@ -12,22 +12,22 @@ B. Tesseract OCR：直接识别数字（需要安装 tesseract）
 
 import cv2
 import numpy as np
-import os
-import re
 import win32gui
 import win32con
 import win32ui
 import ctypes
-from PIL import Image
 from typing import Optional
+import torch
+from PIL import Image
+from torchvision import transforms
 
+# 假设方向模型与数字模型的定义文件在同一目录下，可按实际路径调整
+from models.multi_task_net import WindNet  # 方向识别模型
+from models.model import build_model  # 数字识别模型构建函数
 from config.settings import (
     WIND_ROI_LEFT_RATIO, WIND_ROI_RIGHT_RATIO,
     WIND_ROI_TOP_RATIO, WIND_ROI_BOTTOM_RATIO,
 )
-
-TEMPLATE_DIR = "wind_templates"   # 存放 wind_-5.png ... wind_5.png
-
 
 # ─────────────────────────────────────────────
 #  截取风速区域
@@ -71,147 +71,179 @@ def capture_wind_roi(hwnd: int) -> Optional[np.ndarray]:
 
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-
-# ─────────────────────────────────────────────
-#  策略 A：模板匹配
-# ─────────────────────────────────────────────
-
-_templates: dict = {}   # {wind_value: gray_template_img}
-
-def _load_templates():
-    """加载模板图片，-5 到 +5 共11个值"""
-    global _templates
-    if not os.path.isdir(TEMPLATE_DIR):
-        return False
-    for v in range(-5, 6):
-        fname = os.path.join(TEMPLATE_DIR, f"wind_{v}.png")
-        if os.path.exists(fname):
-            tmpl = cv2.imread(fname, cv2.IMREAD_GRAYSCALE)
-            if tmpl is not None:
-                _templates[v] = tmpl
-    return len(_templates) > 0
-
-
-def _detect_by_template(roi_bgr: np.ndarray) -> Optional[int]:
-    """模板匹配风速，返回 -5~5 的整数，失败返回 None"""
-    if not _templates:
-        if not _load_templates():
-            return None
-
-    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-    best_val  = -1.0
-    best_wind = None
-
-    for wind_val, tmpl in _templates.items():
-        # 如果模板比ROI大则跳过
-        if tmpl.shape[0] > gray.shape[0] or tmpl.shape[1] > gray.shape[1]:
-            continue
-        res = cv2.matchTemplate(gray, tmpl, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, _ = cv2.minMaxLoc(res)
-        if max_val > best_val:
-            best_val  = max_val
-            best_wind = wind_val
-
-    if best_val < 0.6:   # 置信度阈值
-        return None
-    return best_wind
-
-
-# ─────────────────────────────────────────────
-#  策略 B：OCR（fallback）
-# ─────────────────────────────────────────────
-
-def _detect_by_ocr(roi_bgr: np.ndarray) -> Optional[int]:
-    """
-    用 Tesseract 识别风速数字。
-    要求安装: pip install pytesseract  +  系统安装 Tesseract。
-    """
-    try:
-        import pytesseract
-    except ImportError:
-        return None
-
-    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-    # 放大2x + 二值化，提升OCR准确率
-    scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    _, binary = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    cfg = r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789+-'
-    text = pytesseract.image_to_string(binary, config=cfg).strip()
-
-    # 提取数字（含负号）
-    match = re.search(r'[+-]?\d+', text)
-    if match:
-        val = int(match.group())
-        if -5 <= val <= 5:
-            return val
-    return None
-
-
-# ─────────────────────────────────────────────
-#  策略 C：像素计数法（不依赖任何外部库的最后防线）
-# ─────────────────────────────────────────────
-
-def _detect_by_pixel_heuristic(roi_bgr: np.ndarray) -> Optional[int]:
-    """
-    简单启发式：弹弹堂的风速箭头向右偏 = 正风，向左 = 负风。
-    通过检测顶部风速区域中橙色/黄色箭头像素的水平重心判断方向和强度。
-    注意：这是粗略估计，误差约 ±1。
-    """
-    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-    # 橙色范围（箭头颜色）
-    lower = np.array([10, 100, 150])
-    upper = np.array([30, 255, 255])
-    mask  = cv2.inRange(hsv, lower, upper)
-
-    pixels = cv2.findNonZero(mask)
-    if pixels is None or len(pixels) < 5:
-        return 0   # 默认无风
-
-    xs = pixels[:, 0, 0]
-    cx = float(np.mean(xs))
-    img_cx = roi_bgr.shape[1] / 2.0
-
-    # 水平偏移映射到 -5~5
-    offset_ratio = (cx - img_cx) / (img_cx)   # -1 ~ +1
-    wind = round(offset_ratio * 5)
-    return max(-5, min(5, wind))
-
-
 # ─────────────────────────────────────────────
 #  统一入口
 # ─────────────────────────────────────────────
 
-def detect_wind(hwnd: int) -> int:
+
+class WindReader:
+    """
+    风力图读取器：
+        - 识别箭头方向（左/右）
+        - 识别风速（0.0 ~ 5.0）
+    """
+
+    def __init__(self,
+                 direction_model_path='best_direction_model.pth',
+                 digit_model_path='checkpoints/best_model.pth',
+                 device=None):
+        """
+        初始化并加载模型
+
+        Args:
+            direction_model_path: 方向识别模型权重文件路径
+            digit_model_path:     数字识别模型权重文件路径
+            device:               运行设备，None 则自动选择
+        """
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
+
+        print(f"[WindReader] 使用设备: {self.device}")
+
+        # ---------- 加载方向识别模型 ----------
+        print(f"[WindReader] 加载方向模型: {direction_model_path}")
+        self.dir_model = WindNet().to(self.device)
+        checkpoint_dir = torch.load(direction_model_path, map_location=self.device)
+        self.dir_model.load_state_dict(checkpoint_dir)  # 假设直接保存 state_dict
+        self.dir_model.eval()
+
+        # 方向模型预处理 (与训练一致)
+        self.dir_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+
+        # ---------- 加载数字识别模型 ----------
+        print(f"[WindReader] 加载数字模型: {digit_model_path}")
+        ckpt = torch.load(digit_model_path, map_location=self.device)
+        cfg = ckpt.get("config", {})
+        self.digit_img_size = cfg.get("img_size", 64)
+        model_type = cfg.get("model_type", "resnet")
+        num_classes = cfg.get("num_classes", 10)
+
+        self.digit_model = build_model(model_type, num_classes=num_classes)
+        self.digit_model.load_state_dict(ckpt["model_state"])
+        self.digit_model = self.digit_model.to(self.device)
+        self.digit_model.eval()
+
+        # 数字模型预处理
+        self.digit_transform = transforms.Compose([
+            transforms.Resize((self.digit_img_size, self.digit_img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
+        ])
+
+        val_acc = ckpt.get("val_acc", "N/A")
+        if isinstance(val_acc, float):
+            print(f"[WindReader] 数字模型验证准确率: {val_acc * 100:.2f}%")
+        print("[WindReader] 模型加载完成\n")
+
+    def _load_image(self, image_input):
+        """将输入统一转换为 RGB PIL Image"""
+        if isinstance(image_input, str):
+            img = Image.open(image_input).convert('RGB')
+        elif isinstance(image_input, Image.Image):
+            img = image_input.convert('RGB')
+        else:
+            # 假设为 numpy 数组
+            from PIL import Image as PILImage
+            import numpy as np
+            if isinstance(image_input, np.ndarray):
+                img = PILImage.fromarray(image_input).convert('RGB')
+            else:
+                raise TypeError("不支持的图像输入类型，支持：路径字符串、PIL.Image、numpy数组")
+        return img
+
+    @torch.no_grad()
+    def _predict_direction(self, img_pil):
+        """预测箭头方向，返回 ('+', 'right') 或 ('-', 'left')"""
+        x = self.dir_transform(img_pil).unsqueeze(0).to(self.device)
+        dir_logits, _ = self.dir_model(x)  # 模型返回两个输出，我们只需第一个
+        direction_idx = dir_logits.argmax(dim=1).item()
+        if direction_idx == 1:
+            return '+', 'right'
+        else:
+            return '-', 'left'
+
+    @torch.no_grad()
+    def _predict_digit(self, img_pil):
+        """识别单个数字图像，返回预测数字 (int)"""
+        x = self.digit_transform(img_pil).unsqueeze(0).to(self.device)
+        logits = self.digit_model(x)
+        pred = logits.argmax(dim=1).item()
+        return pred
+
+    def predict(self, image_input):
+        """
+        对整张风力图进行识别
+
+        Args:
+            image_input: 图片路径 或 PIL.Image 对象
+
+        Returns:
+            dict: {
+                "direction": "+" 或 "-",
+                "tag": "right" 或 "left",
+                "speed": float (0.0 ~ 5.0)
+            }
+        """
+        img = self._load_image(image_input)
+        width, height = img.size
+
+        # 确保宽度至少为 86 (方向图) 和 48+38 (风速图)
+        # 若不符合，根据实际需求可调整或报错，此处简单断言
+        # assert width >= 86, f"图像宽度不足，至少需要 86 像素，当前 {width}"
+
+        # 1. 方向识别：使用整张图（或约定区域，原脚本用整张 86x35）
+        #    若输入图尺寸不同，需确认是否仍能正常识别；此处保持与原训练一致，假定输入就是 86x35
+        direction_sign, direction_tag = self._predict_direction(img)
+
+        # 2. 风速识别：从 x=48 处切分为左右两部分
+        #    左半部分（整数部分）: 0 到 48 宽
+        #    右半部分（小数部分）: 48 到 width
+        left_part = img.crop((0, 0, 48, height))  # 整数位
+        right_part = img.crop((48, 0, width, height))  # 小数位
+
+        int_digit = self._predict_digit(left_part)
+        frac_digit = self._predict_digit(right_part)
+
+        speed = float(f"{int_digit}.{frac_digit}")
+
+        return {
+            "direction": direction_sign,
+            "tag": direction_tag,
+            "speed": speed
+        }
+
+
+reader = WindReader(
+    direction_model_path='best_direction_model.pth',
+    digit_model_path='checkpoints/best_model.pth'
+)
+def detect_wind(hwnd: int):
     """
     识别当前风速，返回 -5 ~ +5 的整数（正 = 向右）。
     自动按优先级尝试三种策略。
     """
     roi = capture_wind_roi(hwnd)
-    if roi is None:
-        return 0
-
-    # 优先级：模板 > OCR > 像素
-    result = _detect_by_template(roi)
-    if result is not None:
-        return result
-
-    result = _detect_by_ocr(roi)
-    if result is not None:
-        return result
-
-    result = _detect_by_pixel_heuristic(roi)
-    return result if result is not None else 0
+    return reader.predict(roi)
 
 
-def save_wind_template(hwnd: int, wind_value: int):
-    """
-    工具函数：在已知风速为 wind_value 时截图保存为模板。
-    使用方法：在游戏中看到风速为 N 时调用此函数。
-    """
-    os.makedirs(TEMPLATE_DIR, exist_ok=True)
-    roi = capture_wind_roi(hwnd)
-    if roi is not None:
-        path = os.path.join(TEMPLATE_DIR, f"wind_{wind_value}.png")
-        cv2.imwrite(path, roi)
-        print(f"[wind] 模板已保存: {path}")
+# ──────────────────────────────────────────────
+# 使用示例
+# ──────────────────────────────────────────────
+if __name__ == '__main__':
+    # 初始化读取器（请根据实际模型路径修改）
+    reader = WindReader(
+        direction_model_path='best_direction_model.pth',
+        digit_model_path='checkpoints/best_model.pth'
+    )
+
+    # 单张图片预测
+    test_image = r'E:\project\dandan_aim\tools\test\wind_1775667351.png'
+    result = reader.predict(test_image)
+    print("识别结果:", result)
